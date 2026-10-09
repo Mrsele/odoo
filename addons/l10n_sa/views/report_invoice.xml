@@ -7,7 +7,8 @@
             <t t-if="o.company_id.country_id.code == 'SA' and o.is_sale_document() and not o._l10n_sa_is_legal() " t-set="custom_header_sa">
                 <div class="fw-bold text-center mt-2">
                     <h5>THIS IS NOT A LEGAL DOCUMENT</h5>
-                    <h5>هذا المستند ليس مستنداً قانونياً</h5>
+                    <h5 t-if="display_in_en" t-translation="off">THIS IS NOT A LEGAL DOCUMENT</h5>
+                    <h5 t-if="display_in_ar" t-translation="off">هذا المستند ليس مستنداً قانونياً</h5>
                 </div>
                 <!-- To help with centering the previous div in flex justify between-->
                 <div t-if="is_html_empty(o.company_id.report_header)" class="col-1"/>
@@ -185,7 +186,7 @@
         <!-- End Credit/Debit notes reasons -->
         <!-- Call custom tax totals templates -->
          <div id="right-elements" position="attributes">
-            <attribute name="t-attf-class">#{'col-6 mt-5' if report_type == 'pdf' else 'col-12 col-md-5'} ms-5 d-inline-block float-end</attribute>
+            <attribute name="t-attf-class">#{'col-7 mt-5' if report_type == 'pdf' else 'col-12 col-md-7'} ms-5 d-inline-block float-end</attribute>
          </div>
         <t t-call="l10n_gcc_invoice.l10n_gcc_document_tax_totals" position="attributes">
             <attribute name="t-call">l10n_sa.l10n_sa_document_tax_totals</attribute>

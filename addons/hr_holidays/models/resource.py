@@ -64,11 +64,11 @@ class ResourceCalendarLeaves(models.Model):
 
         previous_durations = leaves.mapped('number_of_days')
         previous_states = leaves.mapped('state')
+        self.env.add_to_compute(self.env['hr.leave']._fields['number_of_days'], leaves)
+        self.env.add_to_compute(self.env['hr.leave']._fields['duration_display'], leaves)
         leaves.sudo().write({
             'state': 'confirm',
         })
-        self.env.add_to_compute(self.env['hr.leave']._fields['number_of_days'], leaves)
-        self.env.add_to_compute(self.env['hr.leave']._fields['duration_display'], leaves)
         sick_time_status = self.env.ref('hr_holidays.leave_type_sick_time_off', raise_if_not_found=False)
         leaves_to_recreate = self.env['hr.leave']
         for previous_duration, leave, state in zip(previous_durations, leaves, previous_states):
@@ -162,6 +162,11 @@ class ResourceCalendarLeaves(models.Model):
 
         return res
 
+    @api.depends('calendar_id')
+    def _compute_company_id(self):
+        for leave in self:
+            leave.company_id = leave.holiday_id.employee_id.company_id or leave.calendar_id.company_id or self.env.company
+
 
 class ResourceCalendar(models.Model):
     _inherit = "resource.calendar"
@@ -187,7 +192,7 @@ class ResourceResource(models.Model):
 
     def _format_leave(self, leave, resource_hours_per_day, resource_hours_per_week, ranges_to_remove, start_day, end_day, locale):
         leave_start = leave[0]
-        leave_record = leave[2]
+        leave_record = leave[2].filtered('holiday_id')
         holiday_id = leave_record.holiday_id
         tz = pytz.timezone(self.tz or self.env.user.tz)
 

@@ -1,8 +1,10 @@
-# -*- coding: utf-8 -*-
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
-from odoo.addons.account.tests.common import AccountTestInvoicingCommon
-from odoo.tests import Form, tagged
+
+from odoo import Command
 from odoo.exceptions import AccessError
+from odoo.tests import Form, tagged
+
+from odoo.addons.account.tests.common import AccountTestInvoicingCommon
 
 
 @tagged('post_install', '-at_install')
@@ -136,3 +138,51 @@ class TestPurchaseInvoice(AccountTestInvoicingCommon):
             'uom_id': uom.id,
         })
         self.assertTrue(product, "The default purchase UOM should be in the same category as the sale UOM.")
+
+    def test_change_uom_without_purchase_access(self):
+        """A product manager without Purchase access can change the UoM of a
+        product used on a purchase order line, and the line follows it."""
+        product_manager = self.env['res.users'].create({
+            'name': 'Product manager',
+            'login': 'productManagerUom',
+            'group_ids': [Command.set([
+                self.env.ref('base.group_user').id,
+                self.env.ref('product.group_product_manager').id,
+            ])],
+        })
+        product = self.env['product.template'].create({
+            'name': 'Test Product UOM Change',
+            'uom_id': self.env.ref('uom.product_uom_unit').id,
+        })
+        purchase_order = self.env['purchase.order'].create({
+            'partner_id': self.vendor.id,
+            'order_line': [Command.create({'product_id': product.product_variant_id.id})],
+        })
+        uom_dozen = self.env.ref('uom.product_uom_dozen')
+
+        product.with_user(product_manager).uom_id = uom_dozen
+        self.assertEqual(purchase_order.order_line.product_uom_id, uom_dozen)
+
+    def test_prepare_purchase_order_line_from_branch_company(self):
+        """Check that a purchase order line can be created from a nested branch company."""
+        self.env.company.child_ids = [Command.create({
+            'name': "Test Branch",
+            'child_ids': [Command.create({'name': "Nested Branch"})],
+        })]
+        nested_branch = self.env.company.child_ids.child_ids
+        self.purchase_user.write({
+            'company_ids': [Command.set(nested_branch.ids)],
+            'company_id': nested_branch.id,
+        })
+
+        PurchaseOrder = self.env['purchase.order'].with_user(self.purchase_user)
+        order = PurchaseOrder.create({'partner_id': self.vendor.id})
+        nested_branch = nested_branch.with_env(PurchaseOrder.env)
+        product = self.product.with_env(PurchaseOrder.env)
+        vendor = self.vendor.with_env(PurchaseOrder.env)
+
+        self.env.invalidate_all()
+        po_line_vals = PurchaseOrder.order_line._prepare_purchase_order_line(
+            product, 1, product.uom_id, nested_branch, vendor, order,
+        )
+        self.assertTrue(PurchaseOrder.order_line.create(po_line_vals))

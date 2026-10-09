@@ -59,6 +59,8 @@ import * as _network from "../mock/network";
 import * as _notification from "../mock/notification";
 import * as _window from "../mock/window";
 
+const { isPrevented, mockPreventDefault } = _window;
+
 /**
  * @typedef {{
  *  readonly config: (config: JobConfig) => CurrentConfigurators;
@@ -198,15 +200,6 @@ function formatAssertions(assertions) {
         }
     }
     return lines;
-}
-
-/**
- * @param {Event} ev
- */
-function safePrevent(ev) {
-    if (ev.cancelable) {
-        ev.preventDefault();
-    }
 }
 
 /**
@@ -473,8 +466,10 @@ export class Runner {
             internalRandom.seed = this.config.random;
         }
 
-        on(window, "error", this._handleError.bind(this));
-        on(window, "unhandledrejection", this._handleError.bind(this));
+        this._handleError = this._handleError.bind(this);
+
+        on(window, "error", this._handleError);
+        on(window, "unhandledrejection", this._handleError);
     }
 
     /**
@@ -925,9 +920,6 @@ export class Runner {
 
         this.state.status = "running";
 
-        /** @type {Runner["_handleError"]} */
-        const handleError = this._handleError.bind(this);
-
         let job = this._nextJob(jobs);
         while (job && this.state.status === "running") {
             const callbackChain = this._getCallbackChain(job);
@@ -943,16 +935,16 @@ export class Runner {
                         this.suiteStack.push(suite);
 
                         suite.before();
-                        await this._callbacks.call("before-suite", suite, handleError);
-                        await suite.callbacks.call("before-suite", suite, handleError);
+                        await this._callbacks.call("before-suite", suite, this._handleError);
+                        await suite.callbacks.call("before-suite", suite, this._handleError);
                     }
                     if (suite.currentJobIndex >= suite.currentJobs.length) {
                         // after suite code
                         this.suiteStack.pop();
 
                         await this._execAfterCallback(async () => {
-                            await suite.callbacks.call("after-suite", suite, handleError);
-                            await this._callbacks.call("after-suite", suite, handleError);
+                            await suite.callbacks.call("after-suite", suite, this._handleError);
+                            await this._callbacks.call("after-suite", suite, this._handleError);
                         });
                         suite.after();
 
@@ -991,6 +983,8 @@ export class Runner {
                 continue;
             }
 
+            logger.logTest(test);
+
             // Suppress console errors and warnings if test is in "todo" mode
             // (and not in debug).
             const restoreConsole = handleConsoleIssues(test, !this.debug);
@@ -1000,7 +994,7 @@ export class Runner {
             this.expectHooks.before(test);
             test.before();
             for (const callbackRegistry of [...callbackChain].reverse()) {
-                await callbackRegistry.call("before-test", test, handleError);
+                await callbackRegistry.call("before-test", test, this._handleError);
             }
 
             let timeoutId = 0;
@@ -1020,7 +1014,7 @@ export class Runner {
                         const msg = `test ${stringify(
                             test.name
                         )} timed out after ${timeout} milliseconds`;
-                        reject(new HootError(msg, { level: "global" }));
+                        reject(new HootError(msg));
                     }, timeout);
                 }
             }).then(() => {
@@ -1030,13 +1024,7 @@ export class Runner {
 
             // Run test
             await Promise.race([testPromise, timeoutPromise])
-                .catch((error) => {
-                    if (handleError) {
-                        return handleError(error);
-                    } else {
-                        throw error;
-                    }
-                })
+                .catch(this._handleError)
                 .finally(() => {
                     this._resolveCurrent = null;
 
@@ -1049,7 +1037,7 @@ export class Runner {
             const { lastResults } = test;
             await this._execAfterCallback(async () => {
                 for (const callbackRegistry of callbackChain) {
-                    await callbackRegistry.call("after-test", test, handleError);
+                    await callbackRegistry.call("after-test", test, this._handleError);
                 }
             });
             test.after();
@@ -1058,14 +1046,7 @@ export class Runner {
 
             // Log test errors and increment counters
             this.expectHooks.after(this);
-            if (lastResults.pass) {
-                logger.logTest(test);
-
-                if (this.state.failedIds.has(test.id)) {
-                    this.state.failedIds.delete(test.id);
-                    storageSet(STORAGE.failed, [...this.state.failedIds]);
-                }
-            } else {
+            if (!lastResults.pass) {
                 this._failed++;
 
                 const failReasons = [];
@@ -1098,9 +1079,12 @@ export class Runner {
                     this.state.failedIds.add(test.id);
                     storageSet(STORAGE.failed, [...this.state.failedIds]);
                 }
+            } else if (this.state.failedIds.has(test.id)) {
+                this.state.failedIds.delete(test.id);
+                storageSet(STORAGE.failed, [...this.state.failedIds]);
             }
 
-            await this._callbacks.call("after-post-test", test, handleError);
+            await this._callbacks.call("after-post-test", test, this._handleError);
 
             this._pushTest(test);
             this.totalTime = formatTime($now() - this._startTime);
@@ -1160,6 +1144,17 @@ export class Runner {
         }
 
         await this._callbacks.call("after-all", this, logger.error);
+
+        if (this.headless) {
+            // Log root suite results in headless
+            const restoreLogLevel = logger.setLogLevel("suites");
+            for (const suite of this.suites.values()) {
+                if (!suite.parent) {
+                    logger.logSuite(suite);
+                }
+            }
+            restoreLogLevel();
+        }
 
         const { passed, failed, assertions } = this.reporting;
         if (failed > 0) {
@@ -1737,7 +1732,7 @@ export class Runner {
         this._populateState = false;
 
         if (!this.state.tests.length) {
-            throw new HootError(`no tests to run`, { level: "critical" });
+            logger.logGlobal(`no tests to run`);
         }
 
         // Reduce non-included suites & tests info to a miminum
@@ -1782,15 +1777,16 @@ export class Runner {
             return;
         }
         const error = ensureError(ev);
-        if (handledErrors.has(error)) {
-            // Already handled
-            return safePrevent(ev);
-        }
-        handledErrors.add(error);
-
         if (!isInstanceOf(ev, Event)) {
             ev = new ErrorEvent("error", { error });
         }
+        if (handledErrors.has(error)) {
+            // Already handled
+            return ev.preventDefault();
+        }
+        handledErrors.add(error);
+
+        mockPreventDefault(ev);
 
         if (error.message.includes(RESIZE_OBSERVER_MESSAGE)) {
             // Stop event
@@ -1798,21 +1794,24 @@ export class Runner {
             if (ev.bubbles) {
                 ev.stopPropagation();
             }
-            return safePrevent(ev);
+            return ev.preventDefault();
         }
 
-        if (this.state.currentTest && !(error instanceof HootError)) {
+        if (this.state.currentTest) {
             // Handle the error in the current test
             const handled = this._handleErrorInTest(ev, error);
             if (handled) {
-                return safePrevent(ev);
+                if (!(error instanceof HootError)) {
+                    ev.preventDefault();
+                }
+                return;
             }
         } else {
             this._handleGlobalError(ev, error);
         }
 
         // Prevent error event
-        safePrevent(ev);
+        ev.preventDefault();
 
         // Log error
         if (error.level) {
@@ -1832,7 +1831,7 @@ export class Runner {
     _handleErrorInTest(ev, error) {
         for (const callbackRegistry of this._getCallbackChain(this.state.currentTest)) {
             callbackRegistry.callSync("error", ev, logger.error);
-            if (ev.defaultPrevented) {
+            if (isPrevented(ev)) {
                 // Prevented in tests
                 return true;
             }

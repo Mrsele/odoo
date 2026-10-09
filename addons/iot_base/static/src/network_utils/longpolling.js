@@ -26,6 +26,7 @@ export class IoTLongpolling {
         this._delayedStartPolling(this.rpcDelay);
         this.notification = notification;
         this.orm = orm;
+        this.useLna = false;
     }
 
     /**
@@ -64,9 +65,13 @@ export class IoTLongpolling {
      * @param {string} listener_id
      */
     removeListener(iot_ip, device_identifier, listener_id) {
-        const device = this._listeners[iot_ip].devices[device_identifier];
+        const listener = this._listeners[iot_ip];
+        const device = listener.devices[device_identifier];
         if (device && device.listener_id === listener_id) {
-            delete this._listeners[iot_ip].devices[device_identifier];
+            delete listener.devices[device_identifier];
+            if (!Object.keys(listener.devices).length) {
+                this.stopPolling(iot_ip);
+            }
         }
     }
 
@@ -145,9 +150,12 @@ export class IoTLongpolling {
             if (this._listeners[iot_ip] && route === this.pollRoute) {
                 this._listeners[iot_ip].abortController = abortController;
             }
-            return await post(iot_ip, route, params, timeout, headers, abortController.signal);
+            return await post(iot_ip, route, params, timeout, headers, abortController.signal, this.useLna);
         } catch (error) {
-            if (!fallback && error?.name !== "AbortError") {
+            if (error?.name === "AbortError") {
+                throw error;
+            }
+            if (!fallback) {
                 this._doWarnFail(iot_ip);
             }
             throw new Error("Longpolling action failed");
@@ -168,18 +176,21 @@ export class IoTLongpolling {
             (result) => {
                 this._retries = 0;
                 this._listeners[iot_ip].abortController = null;
-                const remainingDevices = Object.keys(this._listeners[iot_ip].devices || {});
                 if (result.result) {
                     if (this._session_id === result.result.session_id) {
                         this._onSuccess(iot_ip, result.result);
                     }
-                } else if (remainingDevices.length > 0) {
+                }
+                const remainingDevices = Object.keys(this._listeners[iot_ip].devices || {});
+                if (remainingDevices.length > 0 && !this._listeners[iot_ip].abortController) {
                     this._poll(iot_ip);
                 }
             },
             (e) => {
                 if (e.name === "TimeoutError") {
-                    this._onError();
+                    this._onPollTimeout();
+                } else if (e.name !== "AbortError") {
+                    this._onPollNetworkError(iot_ip);
                 }
             }
         );
@@ -187,19 +198,19 @@ export class IoTLongpolling {
 
     _onSuccess(iot_ip, result) {
         this._listeners[iot_ip].last_event = result.time;
-
-        const devices = this._listeners[iot_ip].devices;
-        devices[result.device_identifier]?.callback(result);
-
-        if (Object.keys(devices || {}).length > 0) {
-            this._poll(iot_ip);
-        }
+        this._listeners[iot_ip].devices[result.device_identifier]?.callback(result);
         this._retries = 0;
     }
 
-    _onError() {
+    _onPollTimeout() {
         this._retries++;
         this._delayedStartPolling(Math.min(this.rpcDelay * this._retries, this.maxRpcDelay));
+    }
+
+    _onPollNetworkError(iot_ip) {
+        for (const device of Object.values(this._listeners[iot_ip].devices)) {
+            device.callback({ status: "unreachable" });
+        }
     }
 
     /**
@@ -214,6 +225,15 @@ export class IoTLongpolling {
                 type: "danger",
             }
         );
+    }
+
+    /**
+     * Enable/disable using Local Network Access.
+     * This forces HTTP on all IoT requests.
+     * @param {boolean} isLnaEnabled
+     */
+    setLna(isLnaEnabled) {
+        this.useLna = isLnaEnabled;
     }
 }
 

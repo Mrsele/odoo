@@ -5,17 +5,22 @@ import {
     expect,
     getCurrent,
     mockFetch,
+    mockLocation,
     mockWebSocket,
     registerDebugInfo,
 } from "@odoo/hoot";
 import { makeErrorFromResponse, rpc, RPCError } from "@web/core/network/rpc";
+import { RPCCache } from "@web/core/network/rpc_cache";
 import { ensureArray, isIterable } from "@web/core/utils/arrays";
 import { isObject } from "@web/core/utils/objects";
-import { RPCCache } from "@web/core/network/rpc_cache";
 import { hashCode } from "@web/core/utils/strings";
 import { serverState } from "../mock_server_state.hoot";
 import { fetchModelDefinitions, globalCachedFetch, registerModelToFetch } from "../module_set.hoot";
-import { DEFAULT_FIELD_PROPERTIES, getFieldDisplayName, S_SERVER_FIELD } from "./mock_fields";
+import {
+    DEFAULT_FIELD_PROPERTIES,
+    getFieldDisplayName,
+    validateAndCleanupField,
+} from "./mock_fields";
 import {
     getRecordQualifier,
     makeKwArgs,
@@ -72,7 +77,7 @@ const { DateTime } = luxon;
  *  pure?: boolean;
  * }} RouteOptions
  *
- * @typedef {`/${string}`} RoutePath
+ * @typedef {`${string}/${string}`} RoutePath
  *
  * @typedef {{
  *  actions?: Partial<MockServer["actions"]>;
@@ -363,10 +368,14 @@ const ROOT_MENU = {
     appID: "root",
 };
 
-const R_DATASET_ROUTE = /\/web\/dataset\/call_(button|kw)\/[\w.-]+\/(?<step>\w+)/;
-const R_ROUTE_PARAM = /<((?<type>\w+):)?(?<name>[\w-]+)>/g;
-const R_WILDCARD = /\*+/g;
+/** Providing handlers for internal URLs (blob and data) is **optional** */
+const INTERNAL_URL_PROTOCOLS = ["blob:", "data:"];
+
+const R_DATASET_ROUTE = /\/web\/dataset\/call_(?:button|kw)\/[\w.-]+\/(?<step>\w+)/;
+const R_ROUTE_PARAM = /<(?:(?<type>\w+):)?(?<name>[\w-]+)>/g;
+const R_URL_SPECIAL_CHARACTERS = /[.$+()]/g;
 const R_WEBCLIENT_ROUTE = /(?<step>\/web\/webclient\/\w+)/;
+const R_WILDCARD = /\*+/g;
 
 /** @type {WeakMap<() => any, MockServer>} */
 const mockServers = new WeakMap();
@@ -441,7 +450,7 @@ export class MockServer {
     _ormListeners = [];
     /**
      * @private
-     * @type {[RegExp[], RouteCallback, RouteOptions][]}
+     * @type {[[RegExp, boolean][], RouteCallback, RouteOptions][]}
      */
     _routes = [];
     /**
@@ -542,11 +551,13 @@ export class MockServer {
         this._onRoute(["/web/action/load"], this.loadAction);
         this._onRoute(["/web/action/load_breadcrumbs"], this.loadActionBreadcrumbs);
         this._onRoute(["/web/bundle/<string:bundle_name>"], this.loadBundle);
-        this._onRoute(["/web/dataset/call_kw", "/web/dataset/call_kw/<path:path>"], this.callKw, {
-            final: true,
-        });
         this._onRoute(
-            ["/web/dataset/call_button", "/web/dataset/call_button/<path:path>"],
+            [
+                "/web/dataset/call_kw",
+                "/web/dataset/call_kw/<path:path>",
+                "/web/dataset/call_button",
+                "/web/dataset/call_button/<path:path>",
+            ],
             this.callKw,
             { final: true }
         );
@@ -637,14 +648,19 @@ export class MockServer {
 
     /**
      * @private
-     * @param {string} route
+     * @param {URL} url
      */
-    _findRouteListeners(route) {
+    _findRouteListeners(url) {
+        // "blob:" and "data:" URLs do not have 'search' and 'hash' parameters
+        const fullRoute = INTERNAL_URL_PROTOCOLS.includes(url.protocol)
+            ? url.href
+            : url.origin + url.pathname;
         /** @type {[RouteCallback, Record<string, string>, RouteOptions][]} */
         const listeners = [];
         for (const [routeRegexes, callback, options] of this._routes) {
-            for (const regex of routeRegexes) {
-                const argsMatch = route.match(regex);
+            for (const [regex, partialMatch] of routeRegexes) {
+                const routePart = partialMatch ? url.pathname : fullRoute;
+                const argsMatch = routePart.match(regex);
                 if (argsMatch) {
                     listeners.unshift([callback, argsMatch.groups, options]);
                 }
@@ -760,19 +776,25 @@ export class MockServer {
 
     /**
      * @private
-     * @param {string} url
+     * @param {string | URL} input
      * @param {RequestInit} init
      */
-    async _handleRequest(url, init) {
-        const request = new Request(url, init);
-        const route = new URL(request.url).pathname;
+    async _handleRequest(input, init) {
+        const request = new Request(input, init);
+        const url = new URL(request.url);
         let jsonRpcParams = getJsonRpcParams(init);
         let error = null;
         let result = null;
 
-        const listeners = this._findRouteListeners(route);
-        if (!listeners.length) {
-            error = new MockServerError(`Unimplemented server route: ${route}`);
+        const listeners = this._findRouteListeners(url);
+        if (!listeners.length && !INTERNAL_URL_PROTOCOLS.includes(url.protocol)) {
+            if (url.origin === mockLocation.origin) {
+                error = new MockServerError(`Unimplemented server route: ${url.pathname}`);
+            } else {
+                error = new MockServerError(
+                    `Unimplemented server external URL: ${url.origin + url.pathname}`
+                );
+            }
         } else {
             for (const [callback, routeParams, { final, pure }] of listeners) {
                 try {
@@ -844,8 +866,10 @@ export class MockServer {
      */
     async _loadModels() {
         const models = this._modelSpecs;
-        const serverModelInheritances = new Set();
         this._modelSpecs = [];
+
+        const allServerFields = new Set();
+        const serverModelInheritances = new Set();
 
         let serverModels = {};
         if (this._modelNamesToFetch.size) {
@@ -892,16 +916,21 @@ export class MockServer {
                 }
 
                 // Fields (lowest priority): server fields definitions
-                for (const [fieldName, serverField] of Object.entries(fields)) {
-                    model._fields[fieldName] = {
-                        ...DEFAULT_FIELD_PROPERTIES,
-                        ...serverField,
-                        ...model._fields[fieldName],
-                        [S_SERVER_FIELD]: true,
-                    };
+                for (const [fieldName, serverFieldDefinition] of Object.entries(fields)) {
+                    const serverField = validateAndCleanupField({
+                        ...DEFAULT_FIELD_PROPERTIES, // 1. common default field properties
+                        ...serverFieldDefinition, // 2. server field properties
+                        ...model._fields[fieldName], // 3. custom properties on local model
+                    });
+                    allServerFields.add(serverField);
+                    model._fields[fieldName] = serverField;
                 }
 
                 Object.assign(model, otherProperties);
+            } else {
+                for (const field of Object.values(model._fields)) {
+                    validateAndCleanupField(field);
+                }
             }
 
             // Validate _rec_name
@@ -962,7 +991,8 @@ export class MockServer {
             for (const [fieldName, field] of Object.entries(model._fields)) {
                 // Check missing models
                 if (field.relation && !this._models[field.relation]) {
-                    if (field[S_SERVER_FIELD]) {
+                    if (allServerFields.has(field)) {
+                        // Delete server fields that are not loaded
                         delete model._fields[fieldName];
                         continue;
                     } else {
@@ -1027,6 +1057,7 @@ export class MockServer {
                 }
                 model.push(record);
             }
+            model._lastRecId = Math.max(model._lastRecId, ...seenIds, 0);
             model._records = [];
 
             // Records without ID are assigned later to avoid collisions
@@ -1110,6 +1141,9 @@ export class MockServer {
     _onRoute(routes, callback, options) {
         const routeRegexes = routes.map((route) => {
             const regexString = route
+                // Only replace special RegExp character that can also be included
+                // in valid URLs
+                .replaceAll(R_URL_SPECIAL_CHARACTERS, "\\$&")
                 // Replace parameters by regex notation and store their names
                 .replaceAll(R_ROUTE_PARAM, (...args) => {
                     const { name, type } = args.pop();
@@ -1117,7 +1151,7 @@ export class MockServer {
                 })
                 // Replace glob wildcards by regex wildcard
                 .replaceAll(R_WILDCARD, ".*");
-            return new RegExp(`^${regexString}$`, "i");
+            return [new RegExp(`^${regexString}$`, "i"), route.startsWith("/")];
         });
 
         this._routes.push([routeRegexes, callback, options || {}]);
@@ -1154,7 +1188,7 @@ export class MockServer {
         const ormArgs = [];
         const routeArgs = [];
         for (const val of ensureArray(args.shift())) {
-            if (typeof val === "string" && val.startsWith("/")) {
+            if (typeof val === "string" && val.includes("/")) {
                 routeArgs.push(val);
             } else {
                 ormArgs.push(val);

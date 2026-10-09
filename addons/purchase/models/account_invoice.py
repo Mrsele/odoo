@@ -6,7 +6,7 @@ import time
 from markupsafe import Markup
 
 from odoo import api, fields, models, Command, _
-from odoo.tools import OrderedSet
+from odoo.tools import float_compare, OrderedSet
 
 _logger = logging.getLogger(__name__)
 
@@ -122,6 +122,9 @@ class AccountMove(models.Model):
 
     @api.depends('partner_id.name', 'partner_id.purchase_warn_msg', 'invoice_line_ids.product_id.purchase_line_warn_msg', 'invoice_line_ids.product_id.display_name')
     def _compute_purchase_warning_text(self):
+        if not self.env.user.has_group('purchase.group_warning_purchase'):
+            self.purchase_warning_text = ''
+            return
         for move in self:
             if move.move_type != 'in_invoice':
                 move.purchase_warning_text = ''
@@ -129,6 +132,9 @@ class AccountMove(models.Model):
             warnings = OrderedSet()
             if partner_msg := move.partner_id.purchase_warn_msg:
                 warnings.add((move.partner_id.name or move.partner_id.display_name) + ' - ' + partner_msg)
+            if partner_parent_msg := move.partner_id.parent_id.purchase_warn_msg:
+                parent = move.partner_id.parent_id
+                warnings.add((parent.name or parent.display_name) + ' - ' + partner_parent_msg)
             for product in move.invoice_line_ids.product_id:
                 if product_msg := product.purchase_line_warn_msg:
                     warnings.add(product.display_name + ' - ' + product_msg)
@@ -142,7 +148,8 @@ class AccountMove(models.Model):
             'res_model': 'purchase.bill.line.match',
             'domain': [
                 ('partner_id', 'in', (self.partner_id | self.partner_id.commercial_partner_id).ids),
-                ('company_id', 'in', self.env.company.ids),
+                ('company_id', 'in', self.env.companies.ids),
+                ('company_id', 'child_of', self.company_id.ids),
                 ('account_move_id', 'in', [self.id, False]),
             ],
             'views': [(self.env.ref('purchase.purchase_bill_line_match_tree').id, 'list')],
@@ -193,6 +200,8 @@ class AccountMove(models.Model):
 
     def _add_purchase_order_lines(self, purchase_order_lines):
         """ Creates new invoice lines from purchase order lines """
+        if not purchase_order_lines:
+            return
         self.ensure_one()
         new_line_ids = self.env['account.move.line']
 
@@ -277,6 +286,7 @@ class AccountMove(models.Model):
         matched_inv_lines = []
         try:
             start_time = time.time()
+            precision = self.env["decimal.precision"].precision_get("Product Price")
             for invoice_line in invoice_lines:
                 # There are no purchase order lines left. We are done matching.
                 if not purchase_lines:
@@ -290,10 +300,10 @@ class AccountMove(models.Model):
                     # The lists are sorted by unit price descendingly.
                     # When the unit price of the purchase line is lower than the unit price of the invoice line,
                     # we cannot get a match anymore.
-                    if purchase_line.price_unit < invoice_line.price_unit:
+                    if float_compare(purchase_line.price_unit, invoice_line.price_unit, precision_digits=precision) < 0:
                         break
 
-                    if (invoice_line.price_unit == purchase_line.price_unit
+                    if (float_compare(invoice_line.price_unit, purchase_line.price_unit, precision_digits=precision) == 0
                             and invoice_line.quantity <= purchase_line.product_qty - purchase_line.qty_invoiced):
                         # The current purchase line is a possible match for the current invoice line.
                         # We calculate the name match ratio and continue with other possible matches.
@@ -518,7 +528,7 @@ class AccountMoveLine(models.Model):
     is_downpayment = fields.Boolean()
     purchase_line_id = fields.Many2one('purchase.order.line', 'Purchase Order Line', ondelete='set null', index='btree_not_null', copy=False)
     purchase_order_id = fields.Many2one('purchase.order', 'Purchase Order', related='purchase_line_id.order_id', readonly=True)
-    purchase_line_warn_msg = fields.Text(related='product_id.purchase_line_warn_msg')
+    purchase_line_warn_msg = fields.Text(compute='_compute_purchase_line_warn_msg')
 
     def _copy_data_extend_business_fields(self, values):
         # OVERRIDE to copy the 'purchase_line_id' field as well.
@@ -540,6 +550,12 @@ class AccountMoveLine(models.Model):
     def _related_analytic_distribution(self):
         # EXTENDS 'account'
         vals = super()._related_analytic_distribution()
-        if self.purchase_line_id and not self.analytic_distribution:
+        if self.purchase_line_id:
             vals |= self.purchase_line_id.analytic_distribution or {}
         return vals
+
+    @api.depends('product_id.purchase_line_warn_msg')
+    def _compute_purchase_line_warn_msg(self):
+        has_group = self.env.user.has_group('purchase.group_warning_purchase')
+        for line in self:
+            line.purchase_line_warn_msg = line.product_id.purchase_line_warn_msg if has_group else ""

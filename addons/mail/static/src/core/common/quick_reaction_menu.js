@@ -4,6 +4,8 @@ import { useDropdownState } from "@web/core/dropdown/dropdown_hooks";
 import { loadEmoji, useEmojiPicker } from "@web/core/emoji_picker/emoji_picker";
 import { useService } from "@web/core/utils/hooks";
 
+/** @typedef {import("@web/core/emoji_picker/emoji_picker").EmojiPicker} EmojiPicker */
+
 /**
  * @typedef {Object} Props
  * @property {Object} action
@@ -26,6 +28,7 @@ export class QuickReactionMenu extends Component {
     setup() {
         this.toggle = useRef("toggle");
         this.store = useService("mail.store");
+        this.ui = useService("ui");
         this.picker = useEmojiPicker(
             null,
             { onSelect: this.toggleReaction.bind(this), class: "overflow-hidden rounded-2" },
@@ -72,22 +75,30 @@ export class QuickReactionMenu extends Component {
     }
 
     getEmojiShortcode(emoji) {
-        return this.store.emojiLoader.loaded?.emojiValueToShortcodes?.[emoji][0] ?? "?";
+        return this.store.emojiLoader.loaded?.emojiValueToShortcodes?.[emoji]?.[0] ?? "?";
     }
 
     onClick() {
         if (!this.store.emojiLoader.isLoaded) {
             loadEmoji();
         }
-        this.picker.close();
-        if (this.dropdown.isOpen) {
-            this.dropdown.close();
+        if (this.ui.isSmall) {
+            this.props.action.onSelected();
         } else {
-            this.dropdown.open();
+            this.picker.close();
+            if (this.dropdown.isOpen) {
+                this.dropdown.close();
+            } else {
+                this.dropdown.open();
+            }
         }
     }
 
-    toggleReaction(emoji) {
+    /**
+     * @param {string} emoji
+     * @param {boolean} [resetOnSelect=true] {@link EmojiPicker.selectEmoji}
+     */
+    toggleReaction(emoji, resetOnSelect = true) {
         const reaction = this.props.message.reactions.find(
             (r) => r.content === emoji && this.props.message.effectiveSelf.in(r.personas)
         );
@@ -97,8 +108,10 @@ export class QuickReactionMenu extends Component {
             this.props.message.react(emoji);
             this.frequentEmojiService.incrementEmojiUsage(emoji);
         }
-        this.dropdown.close();
-        this.picker.close();
+        if (resetOnSelect) {
+            this.dropdown.close();
+            this.picker.close();
+        }
     }
 
     get attClass() {

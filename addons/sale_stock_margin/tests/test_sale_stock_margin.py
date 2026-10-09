@@ -1,8 +1,9 @@
-# -*- coding: utf-8 -*-
 # Part of Odoo. See LICENSE file for full copyright and licensing details.
 
-from odoo import fields
+import datetime
+from freezegun import freeze_time
 
+from odoo import Command, fields
 from odoo.tests import Form, tagged
 from odoo.addons.stock_account.tests.common import TestStockValuationCommon
 
@@ -66,6 +67,29 @@ class TestSaleStockMargin(TestStockValuationCommon):
     #########
     # TESTS #
     #########
+
+    def test_margin_split_done_move_line(self):
+        """Splitting the move line of a done delivery (move quantity and
+        move lines saved together, as the detailed operations form does)
+        must keep the move value and the SO line cost unchanged."""
+        self._make_in_move(self.product_avco, 20, 100)
+        sale_order = self._create_sale_order()
+        order_line = self._create_sale_order_line(sale_order, self.product_avco, 10, 150)
+        sale_order.action_confirm()
+        picking = sale_order.picking_ids
+        picking.button_validate()
+        picking.move_ids.write({
+            'quantity': 10,
+            'move_line_ids': [
+                Command.create({
+                    'product_id': self.product_avco.id,
+                    'quantity': 6,
+                }),
+                Command.update(picking.move_ids.move_line_ids.id, {'quantity': 4}),
+            ]
+        })
+        self.assertRecordValues(picking.move_ids, [{'quantity': 10, 'value': 1000}])
+        self.assertRecordValues(order_line, [{'qty_delivered': 10, 'purchase_price': 100, 'margin': 500}])
 
     def test_sale_stock_margin_1(self):
         sale_order = self._create_sale_order()
@@ -257,6 +281,7 @@ class TestSaleStockMargin(TestStockValuationCommon):
             'currency_id': new_company_currency.id,
         })
         self.env.user.company_id = new_company.id
+        self.env = self.env.user.with_company(new_company.id).env
 
         self.pricelist.currency_id = new_company_currency.id
 
@@ -422,3 +447,246 @@ class TestSaleStockMargin(TestStockValuationCommon):
         delivery.move_ids.quantity = 10
         delivery.button_validate()
         self.assertEqual(sale_order.order_line.filtered(lambda sol: sol.product_id == product2).purchase_price, 10)
+
+    def test_avco_does_not_mix_products_on_compute_avg_price(self):
+        """
+        Ensure that when stock moves are duplicated and their product changed,
+        the sale line linkage is cleared correctly, preventing average price
+        computation from mixing valuation layers of different products.
+        This test verifies that:
+        - The duplicated delivery's moves lose the original sale_line_id when the product changes.
+        - A new sale order line is created for the new product, increasing the total order lines.
+        - Validations of deliveries and return pickings proceed without errors.
+        - The purchase price on the original sale line remains accurate (unchanged).
+        """
+        self.product_avco_auto.uom_id = self.env.ref('uom.product_uom_dozen').id
+        sale_order = self._create_sale_order()
+        sale_order_line = self._create_sale_order_line(sale_order, self.product_avco, 1)
+        sale_order.action_confirm()
+
+        first_delivery = sale_order.picking_ids
+        second_delivery = first_delivery.copy()
+        self.assertEqual(second_delivery.move_ids.sale_line_id, sale_order_line)
+        second_delivery.move_ids.product_id = self.product_avco_auto
+        self.assertFalse(second_delivery.move_ids.sale_line_id)
+        self.assertTrue(len(sale_order.order_line), 2)
+        second_delivery.action_confirm()
+        second_delivery.move_ids.quantity = 1
+        second_delivery.button_validate()
+        self.assertEqual(second_delivery.move_ids.sale_line_id, sale_order.order_line - sale_order_line)
+        stock_picking_return = self.env['stock.return.picking'].create({
+            'picking_id': second_delivery.id,
+        })
+        stock_picking_return.product_return_moves.quantity = 1
+        return_picking = stock_picking_return._create_return()
+        return_picking.move_ids.quantity = 1
+        return_picking.button_validate()
+        self.assertEqual(return_picking.state, 'done')
+
+        first_delivery.move_ids.quantity = 1
+        first_delivery.button_validate()
+        self.assertEqual(first_delivery.state, 'done')
+        self.assertEqual(sale_order_line.purchase_price, 10)
+
+    def test_avco_different_uom(self):
+        pack_of_6 = self.ref('uom.product_uom_pack_6')
+        self.product_avco.write({
+                'standard_price': 1,
+                'list_price': 3,
+                'uom_ids': [pack_of_6],
+            })
+        sale_order = self._create_sale_order()
+        sale_order_line = self.env['sale.order.line'].create({
+            'name': 'Sale order',
+            'order_id': sale_order.id,
+            'product_id': self.product_avco.id,
+            'product_uom_qty': 1,
+            'product_uom_id': pack_of_6,
+        })
+        sale_order.action_confirm()
+        self.assertEqual(sale_order_line.margin, 12.0)
+
+    def test_avco_calc(self):
+        """ test purchase_price and margin correct calculation for avco product"""
+        # need to freezetime due to test being too fast resulting in inconsistent AVCO calculation for in/out moves having the same exact validation date
+        with freeze_time() as freeze:
+            so = self._create_sale_order()
+            self.product_avco_auto.list_price = 100
+            self._make_in_move(self.product_avco_auto, 2, 20)
+            self._make_in_move(self.product_avco_auto, 2, 40)
+            self.assertEqual(self.product_avco_auto.standard_price, 30, "standard_price for avco = (2 * 20 + 2 * 40) / (2 + 2) = 30: 4 in stock")
+            freeze.tick(delta=datetime.timedelta(seconds=2))
+
+            # SOL quantity=2, qty_delivered=0
+            sol = self._create_sale_order_line(so, self.product_avco_auto, 2, 100)
+            self.assertEqual(sol.product_uom_qty, 2)
+            self.assertEqual(sol.qty_delivered, 0)
+            self.assertEqual(sol.purchase_price, 30, "purchase_price should match product's standard_price")
+            self.assertEqual(sol.margin, 140, "margin = (sale price - purchase_price) * SOL quantity = (100 - 30) * 2 = 140")
+
+            # SOL quantity=2, qty_delivered=1
+            so.action_confirm()
+            move = sol.move_ids
+            move.quantity = 1
+            delivery = move.picking_id
+            backorder_wizard_values = delivery.button_validate()
+            backorder_wizard = self.env[(backorder_wizard_values.get('res_model'))].browse(backorder_wizard_values.get('res_id')).with_context(backorder_wizard_values['context'])
+            backorder_wizard.process()
+            # purchase_unit_from_delivery = line.move_ids(done)._get_price_unit = (1 * 30) / (1) = 30
+            # qty_from_std_price = max(SOL quantity - qty_from_delivery, 0) = 2 - 1 = 1
+            self.assertEqual(sol.purchase_price, 30, "purchase_price = (qty_delivered * purchase_unit_from_delivery + qty_from_std_price * standard_price)/(qty_from_delivery + qty_from_std_price) = (1 * 30 + 1 * 30)/ (1 + 1) = 30")
+            self.assertEqual(sol.margin, 140, "margin = (sale price - purchase_price) * SOL quantity = (100 - 30) * 2 = 140")
+            freeze.tick(delta=datetime.timedelta(seconds=2))
+
+            # SOL quantity=2, qty_delivered=3
+            self._make_in_move(self.product_avco_auto, 2, 142.5)
+            self.assertEqual(self.product_avco_auto.standard_price, 75, "standard_price for avco = (3 * 30 + 2 * 142.5) / (3 + 2) = 75: 3 remaining + 2 added to stock")
+            self.assertEqual(sol.purchase_price, 30, "purchase_price shouldn't have changed")
+            freeze.tick(delta=datetime.timedelta(seconds=2))
+            move = sol.move_ids.filtered(lambda m: m.state != 'done')
+            move.quantity = 2
+            delivery = move.picking_id
+            delivery.button_validate()
+            # purchase_unit_from_delivery = line.move_ids(done)._get_price_unit = (1 * 30 + 2 * 75) / (1 + 2) = 60
+            # qty_from_std_price = max(SOL quantity - qty_from_delivery, 0) = max(2 - 3, 0) = 0
+            self.assertEqual(sol.purchase_price, 60, "purchase_price = (qty_delivered * purchase_unit_from_delivery + qty_from_std_price * standard_price)/(qty_from_delivery + qty_from_std_price) = (3 * 60 + 0 * 75)/ (3 + 0) = 60")
+            self.assertEqual(sol.margin, 80, "margin = (sale price - purchase_price) * SOL quantity = (100 - 60) * 2 = 80")
+
+    def test_avco_zero_quantity(self):
+        """ test that the purchase_price and margin are still calculated correctly when 0 quantity SOL
+        including when a return is done for avco valuated product"""
+        # need to freezetime due to test being too fast resulting in inconsistent AVCO calculation for in/out moves having the same exact validation date
+        with freeze_time() as freeze:
+            so = self._create_sale_order()
+            self.product_avco_auto.list_price = 100
+            self._make_in_move(self.product_avco_auto, 2, 20)
+            self._make_in_move(self.product_avco_auto, 2, 40)
+            self.assertEqual(self.product_avco_auto.standard_price, 30, "standard_price for avco = (2 * 20 + 2 * 40) / (2 + 2) = 30: 4 in stock")
+            sol = self._create_sale_order_line(so, self.product_avco_auto, 1, 100)
+            # SOL quantity=1, qty_delivered=0
+            self.assertEqual(sol.product_uom_qty, 1)
+            self.assertEqual(sol.qty_delivered, 0)
+            self.assertEqual(sol.purchase_price, self.product_avco_auto.standard_price, "purchase_price should match product's standard_price")
+            self.assertEqual(sol.margin, 70, "margin = (sale price - purchase_price) * SOL quantity = (100 - 30) * 1 = 70")
+            so.action_confirm()
+
+            # SOL quantity=0, qty_delivered=0
+            sol2 = self._create_sale_order_line(so, self.product_avco_auto, 0, 90)
+            self.assertEqual(sol2.product_uom_qty, 0)
+            self.assertEqual(sol2.qty_delivered, 0)
+            self.assertEqual(sol2.purchase_price, self.product_avco_auto.standard_price, "0 Quantity and 0 Delivered => default to standard price")
+            self.assertEqual(sol2.margin, 0, "margin = 0 if no quantities sold/delivered")
+
+            # SOL quantity=1, qty_delivered=1
+            self._make_in_move(self.product_avco_auto, 2, 60)
+            self.assertEqual(self.product_avco_auto.standard_price, 40, "standard_price for avco = (4 * 30 + 2 * 60) / (4 + 2) = 40: 4 existing + 2 added to stock")
+            freeze.tick(delta=datetime.timedelta(seconds=2))
+            move = sol.move_ids
+            move.quantity = sol.product_uom_qty
+            delivery = move.picking_id
+            delivery.button_validate()
+            self.assertEqual(sol.product_uom_qty, 1)
+            self.assertEqual(sol.qty_delivered, 1)
+            self.assertEqual(sol.purchase_price, self.product_avco_auto.standard_price, "purchase_price should match product's standard_price")
+            self.assertEqual(sol.margin, 60, "margin = (sale price - purchase_price) * SOL quantity = (100 - 40) * 1 = 60")
+            freeze.tick(delta=datetime.timedelta(seconds=2))
+
+            # SOL quantity=1, qty_delivered=-2
+            self._make_in_move(self.product_avco_auto, 2, 5)
+            self.assertEqual(self.product_avco_auto.standard_price, 30, "standard_price for avco = (5 * 40 + 2 * 5) / (5 + 2) = 30: 1 delivered, 5 remaining + 2 added to stock")
+            freeze.tick(delta=datetime.timedelta(seconds=2))
+            stock_return_picking_form = Form(self.env['stock.return.picking'].with_context(active_id=delivery.id, active_model='stock.picking'))
+            stock_return_picking = stock_return_picking_form.save()
+            stock_return_picking.product_return_moves.quantity = 3.0
+            stock_return_picking_action = stock_return_picking.action_create_returns()
+            return_pick = self.env['stock.picking'].browse(stock_return_picking_action['res_id'])
+            return_pick.button_validate()
+            self.assertEqual(sol.product_uom_qty, 1)
+            self.assertEqual(sol.qty_delivered, -2)
+            self.assertEqual(self.product_avco_auto.standard_price, 33, "standard_price for avco = (7 * 30 + 3 * 40) / (7 + 3)) = 33: 7 remaining + 3 returned")
+            self.assertEqual(sol.purchase_price, self.product_avco_auto.standard_price, "< 0 Delivered => default to standard price")
+            self.assertEqual(sol.margin, 67, "margin = (sale price - purchase_price) * SOL quantity = (100 - 33) * 1 = 67")
+            freeze.tick(delta=datetime.timedelta(seconds=2))
+
+            # SOL quantity=0, qty_delivered=-2
+            self._make_in_move(self.product_avco_auto, 2, 30)
+            self.assertEqual(self.product_avco_auto.standard_price, 32.5, "standard_price for avco = (10 * 33 + 2 * 30) / 12 = 32.5: 10 remaining + 2 added to stock")
+            freeze.tick(delta=datetime.timedelta(seconds=2))
+            sol.product_uom_qty = 0
+            self.assertEqual(sol.purchase_price, self.product_avco_auto.standard_price, "< 0 Delivered => default to standard price")
+            self.assertEqual(sol.margin, -135, "margin = (sale price - purchase_price) * qty_delivered = (100 - 32.5) * -2 = -135")
+
+            # SOL quantity=0, qty_delivered=2
+            so2 = self._create_sale_order()
+            # throwaway product so we can deliver extra product in delivery
+            throwaway_sol = self._create_sale_order_line(so2, self.product_standard, 1, 100)
+            so2.action_confirm()
+            move = throwaway_sol.move_ids
+            move.quantity = throwaway_sol.product_uom_qty
+            delivery = move.picking_id
+            with Form(delivery) as delivery_form:
+                with delivery_form.move_ids.new() as extra_move:
+                    extra_move.product_id = self.product_avco_auto
+                    extra_move.quantity = 2
+            delivery.button_validate()
+            sol3 = so2.order_line - throwaway_sol
+            self.assertEqual(sol3.product_uom_qty, 0)
+            self.assertEqual(sol3.qty_delivered, 2)
+            self.assertEqual(self.product_avco_auto.standard_price, 32.5, 'no new incoming moves, std price should be unchanged')
+            # purchase_unit_from_delivery = line.move_ids(done)._get_price_unit = (2 * 32.5) / 2 = 32.5
+            self.assertEqual(sol3.purchase_price, self.product_avco_auto.standard_price, "purchase_price should match product's standard_price")
+            self.assertEqual(sol3.margin, -65, "margin = SOL qty * sale price - purchase_price * qty_delivered = (0 - 32.5) * 2 = -65")
+            freeze.tick(delta=datetime.timedelta(seconds=2))
+
+            # SOL quantity=0, qty_delivered=2-1=1, returned = 1
+            self._make_in_move(self.product_avco_auto, 2, 17.5)  # force different standard_price
+            self.assertEqual(self.product_avco_auto.standard_price, 30, "standard_price for avco = (10 * 32.5 + 2 * 17.5) / (10 + 2) = 30: 2 delivered, 10 remaining + 2 added to stock")
+            freeze.tick(delta=datetime.timedelta(seconds=2))
+            stock_return_picking_form = Form(self.env['stock.return.picking'].with_context(active_id=delivery.id, active_model='stock.picking'))
+            stock_return_picking = stock_return_picking_form.save()
+            stock_return_picking.product_return_moves.quantity = 1.0
+            stock_return_picking_action = stock_return_picking.action_create_returns()
+            return_pick = self.env['stock.picking'].browse(stock_return_picking_action['res_id'])
+            return_pick.button_validate()
+            self.assertEqual(sol3.product_uom_qty, 0)
+            self.assertEqual(sol3.qty_delivered, 1)
+            # purchase_unit_from_delivery = line.move_ids(done)._get_price_unit = (2 * 32.5 + 1 * 32.5) / (2 + 1) = 32.5
+            self.assertEqual(sol3.purchase_price, 32.5, "purchase_price = 2 * 32.5 + 1 * 32.5) / (2 + 1) = 32.5")
+            self.assertEqual(sol3.margin, -32.5, "margin = SOL qty * sale price - purchase_price * qty_delivered = (0 - 32.5) * 1 = -32.5")
+
+    def test_dropship_fifo_purchase_price(self):
+        """ Check that when the product is dropshipped, the purchase_price used is based on the unit
+        price of the purchase order.
+        """
+        try:
+            dropship_route = self.env.ref('stock_dropshipping.route_drop_shipping')
+        except ValueError:
+            self.skipTest('This test requires the following module: stock_dropshipping')
+
+        self.product_fifo_auto.write({
+            'seller_ids': [Command.create({'partner_id': self.vendor.id, 'price': 20})],
+            'route_ids': [Command.link(dropship_route.id)]
+        })
+        # create and confirm SO and PO
+        so = self.env['sale.order'].create({
+            'partner_id': self.customer.id,
+            'order_line': [Command.create({
+                'product_id': self.product_fifo_auto.id,
+                'product_uom_qty': 1.0,
+            })],
+        })
+        so.action_confirm()
+        po = self.env['purchase.order'].search([
+            ('origin', '=', so.name),
+            ('partner_id', '=', self.vendor.id),
+        ], limit=1)
+        po.button_confirm()
+
+        # untill dropship validation, purchase price of the sale order line is the product's standard price
+        self.assertEqual(self.product_fifo_auto.standard_price, 10)
+        self.assertEqual(so.order_line.purchase_price, 10)
+
+        # after dropship validation, purchase price of the sale order line is the PO's unit cost
+        so.picking_ids.button_validate()
+        self.assertEqual(po.order_line.price_unit, 20)
+        self.assertEqual(so.order_line.purchase_price, 20)

@@ -29,6 +29,7 @@ export const WEBSOCKET_CLOSE_CODES = Object.freeze({
     SESSION_EXPIRED: 4001,
     KEEP_ALIVE_TIMEOUT: 4002,
     RECONNECTING: 4003,
+    CLOSING_HANDSHAKE_ABORTED: 4004,
 });
 export const WORKER_STATE = Object.freeze({
     CONNECTED: "CONNECTED",
@@ -36,7 +37,14 @@ export const WORKER_STATE = Object.freeze({
     IDLE: "IDLE",
     CONNECTING: "CONNECTING",
 });
-const MAXIMUM_RECONNECT_DELAY = 60000;
+const MAXIMUM_RECONNECT_DELAY = 120_000;
+// Don't wait to reconnect: keep-alive shouldn't be noticed, and the closing
+// handshake was aborted because the client explicitly tried to connect while
+// the socket was stuck in the closing state.
+const IMMEDIATE_RECONNECT_CLOSE_CODES = [
+    WEBSOCKET_CLOSE_CODES.KEEP_ALIVE_TIMEOUT,
+    WEBSOCKET_CLOSE_CODES.CLOSING_HANDSHAKE_ABORTED,
+];
 const UUID = Date.now().toString(36) + Math.random().toString(36).substring(2);
 const logger = new Logger("bus_websocket_worker");
 
@@ -49,7 +57,7 @@ const logger = new Logger("bus_websocket_worker");
  */
 export class WebsocketWorker {
     INITIAL_RECONNECT_DELAY = 1000;
-    RECONNECT_JITTER = 1000;
+    RECONNECT_JITTER = 30000;
     CONNECTION_CHECK_DELAY = 60_000;
 
     constructor(name) {
@@ -354,7 +362,15 @@ export class WebsocketWorker {
         this._updateState(WORKER_STATE.DISCONNECTED);
         this.lastChannelSubscription = null;
         this.firstSubscribeDeferred = new Deferred();
+        if (IMMEDIATE_RECONNECT_CLOSE_CODES.includes(code)) {
+            this.connectRetryDelay = 0;
+        }
         if (this.isReconnecting) {
+            if (code === WEBSOCKET_CLOSE_CODES.CLOSING_HANDSHAKE_ABORTED) {
+                // This close was triggered manually by `_start`, which discards
+                // the socket right after: nothing else will retry to connect.
+                this._retryConnectionWithDelay();
+            }
             // Connection was not established but the close event was
             // triggered anyway. Let the onWebsocketError method handle
             // this case.
@@ -373,10 +389,6 @@ export class WebsocketWorker {
         // WebSocket was not closed cleanly, let's try to reconnect.
         this.broadcast("BUS:RECONNECTING", { closeCode: code });
         this.isReconnecting = true;
-        if (code === WEBSOCKET_CLOSE_CODES.KEEP_ALIVE_TIMEOUT) {
-            // Don't wait to reconnect on keep alive timeout.
-            this.connectRetryDelay = 0;
-        }
         if (code === WEBSOCKET_CLOSE_CODES.SESSION_EXPIRED) {
             this.isWaitingForNewUID = true;
         }
@@ -462,12 +474,13 @@ export class WebsocketWorker {
     }
 
     /**
-     * Try to reconnect to the server, an exponential back off is
-     * applied to the reconnect attempts.
+     * Try to reconnect to the server, add a random jitter to avoid thundering
+     * herd problem.
      */
     _retryConnectionWithDelay() {
+        clearTimeout(this.connectTimeout);
         this.connectRetryDelay =
-            Math.min(this.connectRetryDelay * 1.5, MAXIMUM_RECONNECT_DELAY) +
+            Math.min(this.connectRetryDelay, MAXIMUM_RECONNECT_DELAY) +
             this.RECONNECT_JITTER * Math.random();
         this._logDebug("_retryConnectionWithDelay", this.connectRetryDelay);
         this.connectTimeout = setTimeout(this._start.bind(this), this.connectRetryDelay);
@@ -519,10 +532,13 @@ export class WebsocketWorker {
         }
         this._removeWebsocketListeners();
         if (this._isWebsocketClosing()) {
-            // close event was not triggered and will never be, broadcast the
-            // disconnect event for consistency sake.
-            this.lastChannelSubscription = null;
-            this.broadcast("BUS:DISCONNECT", { code: WEBSOCKET_CLOSE_CODES.ABNORMAL_CLOSURE });
+            // The close event didn’t trigger. Trigger manually to maintain
+            // correct state and lifecycle handling.
+            this._onWebsocketClose(
+                new CloseEvent("close", { code: WEBSOCKET_CLOSE_CODES.CLOSING_HANDSHAKE_ABORTED })
+            );
+            this.websocket = null;
+            return;
         }
         this._updateState(WORKER_STATE.CONNECTING);
         this.websocket = new WebSocket(this.websocketURL);

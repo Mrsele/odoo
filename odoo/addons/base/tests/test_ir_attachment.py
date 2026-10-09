@@ -344,6 +344,33 @@ class TestPermissions(TransactionCaseWithUserDemo):
         self.assertNotEqual(SUPERUSER_ID, admin_user.id)
         attachment_admin.with_user(admin_user).datas
 
+    def test_search_without_limit(self):
+        """A search without limit returns the readable attachments, in order:
+        public ones, the ones linked to no record for their creator or an
+        administrator, and the ones linked to a readable record.
+        """
+        admin = self.env.ref('base.user_admin')
+        record_vals = {'res_model': self.vals['res_model'], 'res_id': self.vals['res_id']}
+        own = self.Attachments.create({'name': 'own'})
+        own_field = self.Attachments.sudo().create({'name': 'own field', 'res_field': 'image_128', 'create_uid': self.user_demo.id})
+        other = self.Attachments.with_user(admin).create({'name': 'other'})
+        public = self.Attachments.sudo().create({'name': 'public', 'public': True, **record_vals})
+        attachments = self.attachment | own | own_field | other | public
+        domain = [('id', 'in', attachments.ids)]
+
+        def search(user, **kwargs):
+            return self.Attachments.with_user(user).search(domain, **kwargs).ids
+
+        expected_demo = (public | own | self.attachment).sorted('id', reverse=True).ids
+        self.assertEqual(search(self.user_demo), expected_demo)
+        self.assertEqual(search(self.user_demo, offset=1), expected_demo[1:])
+        self.assertEqual(search(admin), attachments.sorted('id', reverse=True).ids)
+
+        # hide the linked record: its attachment is gone, the public one stays
+        self.rule.perm_read = True
+        self.assertEqual(search(self.user_demo), (public | own).sorted('id', reverse=True).ids)
+        self.assertEqual(search(admin), (public | other | own_field | own).sorted('id', reverse=True).ids)
+
     @mute_logger("odoo.addons.base.models.ir_rule", "odoo.models")
     def test_field_read_permission(self):
         """If the record field can't be read,
@@ -453,7 +480,7 @@ class TestPermissions(TransactionCaseWithUserDemo):
     def test_write_error(self):
         # try to write a file in a place where we have no access
         # /proc is not writeable, check if we have an error raised
-        self.patch(IrAttachment, '_get_path', lambda self, binary, _checksum: (binary, '/proc/dummy_test'))
+        self.patch(IrAttachment, '_get_path', lambda self, binary, _checksum: ('dummy_test', '/proc/dummy_test'))
         with self.assertRaises(OSError):
             self.env['ir.attachment']._file_write(b'test', 'test')
 
@@ -473,3 +500,16 @@ class TestPermissions(TransactionCaseWithUserDemo):
 
         with self.assertRaisesRegex(ValidationError, r"Sorry, you are not allowed to write on this document"):
             existing_attachment.type = 'binary'
+
+    def test_circular_attachment(self):
+        """An ir.attachment should not be attached to itself with
+        its res_id. Upon write a UserError should be thrown.
+        """
+
+        Attachment = self.env['ir.attachment']
+        document = Attachment.create({'name': 'document'})
+        with self.assertRaises(ValidationError):
+            document.write({
+                'res_model': 'ir.attachment',
+                'res_id': document.id
+            })

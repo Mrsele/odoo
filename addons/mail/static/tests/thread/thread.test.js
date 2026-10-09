@@ -7,6 +7,7 @@ import {
     insertText,
     isInViewportOf,
     listenStoreFetch,
+    onRpcAfter,
     onRpcBefore,
     openDiscuss,
     openFormView,
@@ -20,7 +21,7 @@ import {
 import { mailDataHelpers } from "@mail/../tests/mock_server/mail_mock_server";
 
 import { describe, expect, test } from "@odoo/hoot";
-import { press, queryFirst, queryValue } from "@odoo/hoot-dom";
+import { press, queryFirst, queryOne, queryValue } from "@odoo/hoot-dom";
 import { Deferred, mockDate, tick } from "@odoo/hoot-mock";
 import {
     asyncStep,
@@ -76,7 +77,8 @@ test("load more messages from channel (auto-load on scroll)", async () => {
     });
     await start();
     await openDiscuss(channelId);
-    await contains("button", { text: "Load More", before: [".o-mail-Message", { count: 30 }] });
+    await contains("button:text(Load More)", { before: [".o-mail-Message", { count: 30 }] });
+    expect(getComputedStyle(queryOne("button:text(Load More)")).opacity).toBe("1");
     await contains(".o-mail-Thread", { scroll: "bottom" });
     await scroll(".o-mail-Thread", 0);
     await contains(".o-mail-Message", { count: 60 });
@@ -434,15 +436,6 @@ test("should not scroll on receiving new message if the list is initially scroll
     await contains(".o-mail-ChatWindow .o-mail-Thread", { scroll: 0 });
 });
 
-test("show empty placeholder when thread contains no message", async () => {
-    const pyEnv = await startServer();
-    const channelId = pyEnv["discuss.channel"].create({ name: "general" });
-    await start();
-    await openDiscuss(channelId);
-    await contains(".o-mail-Thread", { text: "Welcome to #general!" });
-    await contains(".o-mail-Message", { count: 0 });
-});
-
 test("Mention a partner with special character (e.g. apostrophe ')", async () => {
     const pyEnv = await startServer();
     const partnerId = pyEnv["res.partner"].create({
@@ -603,7 +596,7 @@ test("basic rendering of canceled notification", async () => {
         res_id: channelId,
     });
     pyEnv["mail.notification"].create({
-        failure_type: "SMTP",
+        failure_type: "mail_smtp",
         mail_message_id: messageId,
         notification_status: "canceled",
         notification_type: "email",
@@ -730,6 +723,10 @@ test("[text composer] Opening thread with needaction messages should mark all me
     pyEnv["res.users"].write(serverState.userId, { notification_type: "inbox" });
     const channelId = pyEnv["discuss.channel"].create({ name: "General" });
     const partnerId = pyEnv["res.partner"].create({ name: "Demo" });
+    pyEnv["mail.message"].create([
+        { body: "Hello", model: "discuss.channel", res_id: channelId },
+        { body: "World", model: "discuss.channel", res_id: channelId },
+    ]);
     onRpc("mail.message", "mark_all_as_read", ({ args }) => {
         asyncStep("mark-all-messages-as-read");
         expect(args[0]).toEqual([
@@ -737,8 +734,14 @@ test("[text composer] Opening thread with needaction messages should mark all me
             ["res_id", "=", channelId],
         ]);
     });
+    onRpcBefore("/discuss/channel/messages", (args) =>
+        asyncStep(`load messages - ${args["channel_id"]}`)
+    );
     await start();
     await openDiscuss(channelId);
+    await contains(".o-mail-Message", { count: 2 });
+    await waitForSteps([`load messages - ${channelId}`]);
+    await contains("button", { text: "Inbox", contains: [".badge", { count: 0 }] });
     await contains(".o-mail-Composer-input");
     await triggerEvents(".o-mail-Composer-input", ["blur", "focusout"]);
     await click("button", { text: "Inbox" });
@@ -778,6 +781,10 @@ test("Opening thread with needaction messages should mark all messages of thread
     pyEnv["res.users"].write(serverState.userId, { notification_type: "inbox" });
     const channelId = pyEnv["discuss.channel"].create({ name: "General" });
     const partnerId = pyEnv["res.partner"].create({ name: "Demo" });
+    pyEnv["mail.message"].create([
+        { body: "Hello", model: "discuss.channel", res_id: channelId },
+        { body: "World", model: "discuss.channel", res_id: channelId },
+    ]);
     onRpc("mail.message", "mark_all_as_read", ({ args }) => {
         asyncStep("mark-all-messages-as-read");
         expect(args[0]).toEqual([
@@ -785,10 +792,15 @@ test("Opening thread with needaction messages should mark all messages of thread
             ["res_id", "=", channelId],
         ]);
     });
+    onRpcBefore("/discuss/channel/messages", (args) =>
+        asyncStep(`load messages - ${args["channel_id"]}`)
+    );
     await start();
     const composerService = getService("mail.composer");
     composerService.setHtmlComposer();
     await openDiscuss(channelId);
+    await contains(".o-mail-Message", { count: 2 });
+    await waitForSteps([`load messages - ${channelId}`]);
     await contains(".o-mail-Composer-html.odoo-editor-editable");
     await triggerEvents(".o-mail-Composer-html.odoo-editor-editable", ["blur", "focusout"]);
     await click("button", { text: "Inbox" });
@@ -869,6 +881,92 @@ test("can be marked as read while loading", async () => {
     await contains(".o-discuss-badge", { count: 0 });
 });
 
+test("message received while loading thread is kept in the thread", async () => {
+    const pyEnv = await startServer();
+    const partnerId = pyEnv["res.partner"].create({ name: "Demo" });
+    const userId = pyEnv["res.users"].create({ partner_id: partnerId });
+    const channelId = pyEnv["discuss.channel"].create({
+        channel_member_ids: [
+            Command.create({ partner_id: serverState.partnerId }),
+            Command.create({ partner_id: partnerId }),
+        ],
+        name: "General",
+    });
+    const { promise: loadPromise, resolve: loadResolve } = Promise.withResolvers();
+    // Simulate an answer computed before Demo posts: a delayed mock route could include the post.
+    onRpcBefore("/discuss/channel/messages", async () => {
+        await loadPromise;
+        return { data: {}, messages: [] };
+    });
+    await start();
+    await openDiscuss(channelId);
+    await contains(".o-mail-Thread-empty");
+    await withUser(userId, () =>
+        rpc("/mail/message/post", {
+            post_data: { body: "Hello", message_type: "comment" },
+            thread_id: channelId,
+            thread_model: "discuss.channel",
+        })
+    );
+    // The message list is not rendered while the thread loads, so the empty
+    // state going away is the only sign that the message reached the thread.
+    await contains(".o-mail-Thread-empty", { count: 0 });
+    loadResolve();
+    await contains(".o-mail-Message-content:has(:text('Hello'))");
+});
+
+test("message received while loading thread on last read message is shown once after scrolling down", async () => {
+    const pyEnv = await startServer();
+    const partnerId = pyEnv["res.partner"].create({ name: "Demo" });
+    const userId = pyEnv["res.users"].create({ partner_id: partnerId });
+    const channelId = pyEnv["discuss.channel"].create({
+        channel_member_ids: [
+            Command.create({ partner_id: serverState.partnerId }),
+            Command.create({ partner_id: partnerId }),
+        ],
+        name: "General",
+    });
+    const messageIds = pyEnv["mail.message"].create(
+        Array.from({ length: 55 }, (_, i) => ({
+            author_id: partnerId,
+            body: `msg${i}`,
+            message_type: "comment",
+            model: "discuss.channel",
+            res_id: channelId,
+        }))
+    );
+    const [selfMemberId] = pyEnv["discuss.channel.member"].search([
+        ["channel_id", "=", channelId],
+        ["partner_id", "=", serverState.partnerId],
+    ]);
+    pyEnv["discuss.channel.member"].write([selfMemberId], {
+        new_message_separator: messageIds[9],
+    });
+    const { promise: loadPromise, resolve: loadResolve } = Promise.withResolvers();
+    // Simulate the answer reaching the client after Demo posts.
+    onRpcAfter("/discuss/channel/messages", async (response) => {
+        await response;
+        await loadPromise;
+    });
+    await start();
+    await openDiscuss(channelId);
+    await contains(".o-mail-Thread-empty");
+    await withUser(userId, () =>
+        rpc("/mail/message/post", {
+            post_data: { body: "Hello", message_type: "comment" },
+            thread_id: channelId,
+            thread_model: "discuss.channel",
+        })
+    );
+    await contains(".o-mail-Thread-empty", { count: 0 }); // wait for the message
+    loadResolve();
+    await contains(".o-mail-Message-content:has(:text('msg39'))");
+    await contains(".o-mail-Message-content:has(:text('Hello'))", { count: 0 });
+    await scroll(".o-mail-Thread", "bottom");
+    await contains(".o-mail-Message-content:has(:text('msg54'))");
+    await contains(".o-mail-Message-content:has(:text('Hello'))");
+});
+
 test("New message separator not appearing after showing composer on thread", async () => {
     const pyEnv = await startServer();
     pyEnv["mail.message"].create([
@@ -935,7 +1033,8 @@ test("Can scroll to notification", async () => {
     });
     await start();
     await openDiscuss(channelId);
-    await tick(); // wait for the scroll to first unread to complete
+    await contains(".o-mail-Message", { count: 30 });
+    await contains(".o-mail-Thread", { scroll: "bottom" });
     await isInViewportOf(".o-mail-Message:contains(message 59)", ".o-mail-Thread");
     await click("[title='Pinned Messages']");
     await click(".o-discuss-PinnedMessagesPanel a[role='button']", { text: "Jump" });
@@ -978,4 +1077,43 @@ test("Update unread counter when receiving new message", async () => {
         })
     );
     await contains(".o-discuss-badge", { text: "2" });
+});
+
+test("Show start message of conversation", async () => {
+    const pyEnv = await startServer();
+    const partnerId = pyEnv["res.partner"].create({ name: "Demo" });
+    const channelId = pyEnv["discuss.channel"].create({ name: "General" });
+    pyEnv["discuss.channel"].create([
+        { name: "ThreadOne", parent_channel_id: channelId, channel_type: "channel" },
+        {
+            channel_member_ids: [
+                Command.create({ partner_id: serverState.partnerId }),
+                Command.create({ partner_id: partnerId }),
+            ],
+            channel_type: "group",
+        },
+        {
+            channel_member_ids: [
+                Command.create({ partner_id: serverState.partnerId }),
+                Command.create({ partner_id: partnerId }),
+            ],
+            channel_type: "chat",
+        },
+    ]);
+    await start();
+    await openDiscuss();
+    await click(".o-mail-DiscussSidebarChannel", { text: "General" });
+    await contains(".o-mail-Thread:has(:text('Welcome to #General!'))");
+    await contains(".o-mail-Thread p", { text: "This is the start of the #General channel" });
+    await click(".o-mail-DiscussSidebarChannel-subChannel", { text: "ThreadOne" });
+    await contains(".o-mail-Thread:has(:text('ThreadOne'))");
+    await contains(".o-mail-Thread p", { text: "Started by Mitchell Admin" });
+    await click(".o-mail-DiscussSidebarChannel", { text: "Demo" });
+    await contains(".o-mail-Thread:has(:text('Demo'))");
+    await contains(".o-mail-Thread p", { text: "This is the start of your direct chat with Demo" });
+    await click(".o-mail-DiscussSidebarChannel", { text: "Mitchell Admin and Demo" });
+    await contains(".o-mail-Thread:has(:text('Mitchell Admin and Demo'))");
+    await contains(".o-mail-Thread p", {
+        text: "This is the start of Mitchell Admin and Demo group",
+    });
 });

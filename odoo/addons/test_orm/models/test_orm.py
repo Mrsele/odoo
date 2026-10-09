@@ -154,7 +154,8 @@ class TestOrmMessage(models.Model):
     label = fields.Char(translate=True)
     priority = fields.Integer()
     active = fields.Boolean(default=True)
-    has_important_sibling = fields.Boolean(compute='_compute_has_important_sibling')
+    has_important_sibling = fields.Boolean(compute='_compute_has_important_sibling', search='_search_has_important_sibling')
+    body_search = fields.Char(compute='_compute_body_search', search='_search_body_search')
 
     attributes = fields.Properties(
         string='Discussion Properties',
@@ -166,6 +167,20 @@ class TestOrmMessage(models.Model):
         for record in self:
             siblings = record.discussion.with_context(active_test=False).messages - record
             record.has_important_sibling = any(siblings.mapped('important'))
+
+    def _search_has_important_sibling(self, operator, value):
+        if operator != 'in':
+            return NotImplemented
+        # not entirely correct, but sufficent for tests
+        return [('discussion.messages.important', '=', True)]
+
+    @api.depends('body')
+    def _compute_body_search(self):
+        for message in self:
+            message.body_search = message.body
+
+    def _search_body_search(self, operator, value):
+        return [('id', 'in', self._search([('body', operator, value)]))]
 
     @api.constrains('author', 'discussion')
     def _check_author(self):
@@ -480,6 +495,8 @@ class TestOrmRelated(models.Model):
     foo_binary_bin = fields.Binary(related='foo_id.binary_bin', related_sudo=False)
     foo_binary_bin_sudo = fields.Binary(related='foo_id.binary_bin', related_sudo=True, string='Binary Bin Sudo')
 
+    foo_float_id = fields.Float(related='foo_id.test_float')
+
 
 class TestOrmRelated_Foo(models.Model):
     _name = 'test_orm.related_foo'
@@ -499,6 +516,8 @@ class TestOrmRelated_Foo(models.Model):
 
     bar_names = fields.Char(related='bar_ids.name', related_sudo=False, string="Bar Names")
     bar_names_sudo = fields.Char(related='bar_ids.name', related_sudo=True, string="Bar Names Sudo")
+
+    test_float = fields.Float(digits='ORM Precision')
 
 
 class TestOrmRelated_Bar(models.Model):
@@ -1620,6 +1639,26 @@ class TestOrmModel_Selection_Required_For_Write_Override(models.Model):  # noqa:
         return super().write(vals)
 
 
+class SelectionCompanyDependent(models.Model):
+    _name = 'test_orm.model_selection_company_dependent'
+    _description = "Model with a company dependent selection field"
+
+    my_selection = fields.Selection([
+        ('manual', "Manual"),
+        ('auto', "Automatic"),
+    ], company_dependent=True)
+
+
+# pylint: disable=E0102
+class SelectionCompanyDependent(models.Model):  # noqa: F811
+    _inherit = 'test_orm.model_selection_company_dependent'
+    _description = "Model with a company dependent selection field extension without ondelete"
+
+    my_selection = fields.Selection(selection_add=[
+        ('semi_auto', "Semi-Automatic"),
+    ])
+
+
 # Special classes to ensure the correct usage of a shared cache amongst users.
 
 
@@ -2202,6 +2241,7 @@ class TestOrmRelated_Translation_2(models.Model):
     name = fields.Char('Name Related', related='related_id.name', readonly=False)
     html = fields.Html('HTML Related', related='related_id.html', readonly=False)
     computed_name = fields.Char('Name Computed', compute='_compute_name')
+    name_en = fields.Char('Name EN', compute='_compute_name_en')
     computed_html = fields.Char('HTML Computed', compute='_compute_html')
 
     @api.depends_context('lang')
@@ -2209,6 +2249,11 @@ class TestOrmRelated_Translation_2(models.Model):
     def _compute_name(self):
         for record in self:
             record.computed_name = record.related_id.name
+
+    @api.depends('name')
+    def _compute_name_en(self):
+        for record in self.with_context(lang='en_US'):
+            record.name_en = record.name
 
     @api.depends_context('lang')
     @api.depends('related_id.html')
